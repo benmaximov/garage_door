@@ -1,0 +1,15 @@
+[Unit]
+Description=Garage Door Controller
+After=network.target
+
+[Service]
+ExecStartPre=/bin/sleep 1
+Type=simple
+ExecStart=/usr/bin/python3 /root/garage.py
+WorkingDirectory=/root
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

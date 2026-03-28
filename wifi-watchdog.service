@@ -1,0 +1,12 @@
+[Unit]
+Description=WiFi Watchdog - auto-reconnect on drop
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /root/wifi-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
