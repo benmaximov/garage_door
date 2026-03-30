@@ -121,9 +121,17 @@ class _Handler(BaseHTTPRequestHandler):
                 GPIO.output(pin, level)
                 self._send_json(200, {"ok": True, "pin": pin, "state": state})
         elif path == "/hold":
+            import garage
+            garage.api_hold_active = True
+            with garage.relay_lock:
+                if garage.relay_timer is not None:
+                    garage.relay_timer.cancel()
+                    garage.relay_timer = None
             GPIO.output(PA3, GPIO.LOW)
             self._send_json(200, {"ok": True, "PA3": "LOW"})
         elif path == "/release":
+            import garage
+            garage.api_hold_active = False
             GPIO.output(PA3, GPIO.HIGH)
             self._send_json(200, {"ok": True, "PA3": "HIGH"})
         else:

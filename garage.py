@@ -14,10 +14,18 @@ Pulse logic (always active):
                      increment counter (only on first activation, not re-entries)
   LOW edge  (PA0) -> start countdown (HOLD_TIME in peak hours, HOLD_TIME_SHORT outside);
                      PA3 stays LOW; display countdown
+                     (skipped when api_hold_active — door stays held until /release)
   HIGH edge (PA6) -> cancel timer, hold relay static (car in beam)
   LOW edge  (PA6) -> start countdown (same hold-time selection as PA0 LOW)
+                     (skipped when api_hold_active — only car is counted/logged)
   Timer=0         -> set PA3 HIGH (door can close again)
   Another HIGH (PA0) while PA3 LOW -> cancel timer, hold relay static
+
+API hold (api_hold_active flag):
+  /hold    -> sets PA3 LOW and api_hold_active=True; no timer is started or restarted
+              by PA0 or PA6 events until /release is called.
+  /release -> sets PA3 HIGH and api_hold_active=False; normal operation resumes.
+  PA6 events during API hold still log/count cars but do NOT start a countdown.
 
 Display:
   PA3 LOW + PA0/PA6 HIGH -> hold-time static (HOLD_TIME in peak hours, HOLD_TIME_SHORT outside)
@@ -70,6 +78,7 @@ relay_lock         = threading.Lock()
 relay_timer        = None
 relay_release_time = 0.0   # time.time() when relay will release
 _relay_activated   = False  # True only when relay was closed by door-sensor logic
+api_hold_active    = False  # True while /hold API is active; cleared by /release
 
 # ── Debounce ──────────────────────────────────────────────────────────────────
 # Delayed-read debounce: any GPIO interrupt restarts a DEBOUNCE_S timer.
@@ -156,7 +165,10 @@ def _process_pa0_settled():
         # PA0 went LOW: pulse end (remote released)
         print("[sensor] pulse end (LOW)")
         if GPIO.input(PA3) == GPIO.LOW:
-            start_countdown()   # hold_time auto-selected based on in_peak_hours()
+            if api_hold_active:
+                print("[sensor] pulse end - API hold active, no countdown")
+            else:
+                start_countdown()   # hold_time auto-selected based on in_peak_hours()
 
 def pa0_changed(channel):
     """GPIO interrupt: cancel pending PA0 debounce timer and restart it."""
@@ -188,9 +200,12 @@ def _process_pa6_settled():
                 relay_timer.cancel()
                 relay_timer = None
     else:
-        # Car passed: start countdown (like PA0 pulse end)
-        print("[PA6] car passed - starting countdown")
-        start_countdown()
+        # Car passed: start countdown only if not under API hold
+        if api_hold_active:
+            print("[PA6] car passed - API hold active, no countdown")
+        else:
+            print("[PA6] car passed - starting countdown")
+            start_countdown()
 
 def pa6_changed(channel):
     """GPIO interrupt: cancel pending PA6 debounce timer and restart it."""
