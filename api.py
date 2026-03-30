@@ -9,6 +9,8 @@ Endpoints:
   GET /gpio/set?pin=PA1|PA3&state=HIGH|LOW -> set PA1 or PA3 output state
   GET /hold                            -> sets PA3 LOW
   GET /release                         -> sets PA3 HIGH (default)
+  GET /cars                            -> list of PA6 car-pass events in the last 24 h
+                                          [{"ts": "...", "peak": true|false}, ...]
 
 Start by calling start() which launches the server in a daemon thread.
 garage.py calls api.start() during startup.
@@ -22,6 +24,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import OPi.GPIO as GPIO
 import counter as cnt
+import car_log
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 API_PORT           = 8080
@@ -95,6 +98,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "duration": duration})
         elif path == "/gpio":
             self._send_json(200, {pin: GPIO.input(pin) for pin in _READ_PINS})
+        elif path == "/cars":
+            self._send_json(200, car_log.get())
         elif path == "/gpio/set":
             pin = params.get("pin", [None])[0] or ""
             # normalise to canonical "PA<n>" form

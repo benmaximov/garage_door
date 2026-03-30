@@ -33,6 +33,7 @@ from datetime import datetime
 import counter
 import display
 import api
+import car_log
 
 # ── Configuration ────────────────────────────────────────────────────────────
 INTERNET_STATUS_FILE = "/dev/shm/internet_ok"
@@ -43,7 +44,8 @@ INTERVALS = [
 ]
 # Days of week on which the relay may activate (0=Monday ... 6=Sunday)
 ACTIVE_DAYS = [0, 1, 2, 3, 4]   # Monday - Friday
-HOLD_TIME   = 15 * 60            # seconds to hold relay (15 min)
+HOLD_TIME       = 15 * 60        # seconds to hold relay during active hours (15 min)
+HOLD_TIME_SHORT =  60        # seconds to hold relay outside active hours (1 min)
 
 # ── Pin names (SUNXI numbering) ───────────────────────────────────────────────
 PA0 = "PA0"   # opening relay sensor (optocoupler; normal LOW, HIGH on pulse)
@@ -59,8 +61,9 @@ GPIO.setup(PA1, GPIO.OUT, initial=GPIO.LOW)
 GPIO.setup(PA3, GPIO.OUT, initial=GPIO.HIGH)
 GPIO.setup(PA6, GPIO.IN)   # no pull: optocoupler drives LOW normally, HIGH when car passes
 
-# Read initial PA0 state so first edge is always detected correctly
+# Read initial PA0/PA6 state so first edge is always detected correctly
 pa0_was_high = GPIO.input(PA0) == GPIO.HIGH
+pa6_is_high  = GPIO.input(PA6) == GPIO.HIGH
 
 # ── Relay state ───────────────────────────────────────────────────────────────
 relay_lock         = threading.Lock()
@@ -72,9 +75,10 @@ _relay_activated   = False  # True only when relay was closed by door-sensor log
 # Delayed-read debounce: any GPIO interrupt restarts a DEBOUNCE_S timer.
 # When the timer fires (after the signal has settled), the actual pin level
 # is read and processed - handles any number of bounces transparently.
-DEBOUNCE_S         = 0.2
-_debounce_timer    = None
-_flash_counter     = False   # set True to force display to counter phase immediately
+DEBOUNCE_S          = 0.2
+_debounce_timer     = None
+_debounce_pa6_timer = None
+_flash_counter      = False   # set True to force display to counter phase immediately
 
 # ── Internet status ───────────────────────────────────────────────────────────
 def read_internet_status():
@@ -104,9 +108,10 @@ def release_relay():
     GPIO.output(PA3, GPIO.HIGH)
     print("[relay] released")
 
-def close_relay(first_activation):
+def close_relay():
     """Set PA3 LOW (prevent door closing) and cancel any running timer.
     Called on PA0 HIGH edge (pulse start). Timer starts on the next LOW edge (pulse end).
+    Counter increment is handled by the caller before this is called.
     """
     global relay_timer, _relay_activated
     _relay_activated = True
@@ -115,27 +120,25 @@ def close_relay(first_activation):
         if relay_timer is not None:
             relay_timer.cancel()
             relay_timer = None
-    if first_activation:
-        new_count = counter.increment()
-        print("[relay] closed, count=%d" % new_count)
-    else:
-        print("[relay] re-entry while on - timer cancelled, HOLD_TIME static")
+    print("[relay] closed / re-entry - timer cancelled, holding")
 
-def start_countdown():
-    """Start (or restart) HOLD_TIME countdown. Called on PA0 LOW edge (pulse end) or PA6 HIGH."""
+def start_countdown(hold_time=None):
+    """Start (or restart) countdown. Called on PA0 LOW edge (pulse end) or PA6 LOW edge."""
     global relay_timer, relay_release_time
-    relay_release_time = time.time() + HOLD_TIME
+    if hold_time is None:
+        hold_time = HOLD_TIME if in_peak_hours() else HOLD_TIME_SHORT
+    relay_release_time = time.time() + hold_time
     with relay_lock:
         if relay_timer is not None:
             relay_timer.cancel()
-        relay_timer = threading.Timer(HOLD_TIME, release_relay)
+        relay_timer = threading.Timer(hold_time, release_relay)
         relay_timer.daemon = True
         relay_timer.start()
-    print("[relay] countdown started, hold=%ds" % HOLD_TIME)
+    print("[relay] countdown started, hold=%ds" % hold_time)
 
 # ── Interrupt callback (both edges) ──────────────────────────────────────────
-def _process_settled():
-    """Called after DEBOUNCE_S of quiet - read actual pin state and act."""
+def _process_pa0_settled():
+    """Called after DEBOUNCE_S of quiet on PA0 - read actual pin state and act."""
     global pa0_was_high
     state = GPIO.input(PA0) == GPIO.HIGH
     if state == pa0_was_high:
@@ -144,39 +147,64 @@ def _process_settled():
     if state:
         # PA0 went HIGH: pulse start (remote pressed)
         print("[sensor] pulse start (HIGH)")
-        if in_peak_hours():
-            relay_on = GPIO.input(PA3) == GPIO.LOW
-            close_relay(first_activation=not relay_on)
-        else:
-            global _flash_counter
+        relay_on = GPIO.input(PA3) == GPIO.LOW
+        if not relay_on:
+            # First activation: increment counter regardless of peak hours
             new_count = counter.increment()
-            _flash_counter = True
-            print("[relay] outside active hours/days - counted only, count=%d" % new_count)
+            print("[sensor] count=%d" % new_count)
+            if not in_peak_hours():
+                global _flash_counter
+                _flash_counter = True
+                print("[relay] outside active hours/days - short hold")
+        close_relay()   # counter already incremented above if first activation
     else:
         # PA0 went LOW: pulse end (remote released)
         print("[sensor] pulse end (LOW)")
         if GPIO.input(PA3) == GPIO.LOW:
-            start_countdown()
+            start_countdown()   # hold_time auto-selected based on in_peak_hours()
 
-def door_changed(channel):
-    """GPIO interrupt: cancel pending debounce timer and restart it."""
-    state = GPIO.input(PA0)
-    
+def pa0_changed(channel):
+    """GPIO interrupt: cancel pending PA0 debounce timer and restart it."""
     global _debounce_timer
     if _debounce_timer is not None:
         _debounce_timer.cancel()
-    _debounce_timer = threading.Timer(DEBOUNCE_S, _process_settled)
+    _debounce_timer = threading.Timer(DEBOUNCE_S, _process_pa0_settled)
     _debounce_timer.daemon = True
     _debounce_timer.start()
 
-GPIO.add_event_detect(PA0, GPIO.BOTH, callback=door_changed, bouncetime=50)
+GPIO.add_event_detect(PA0, GPIO.BOTH, callback=pa0_changed, bouncetime=50)
+
+def _process_pa6_settled():
+    """Called after DEBOUNCE_S of quiet on PA6 - read actual pin state and act."""
+    global pa6_is_high, relay_timer
+    state = GPIO.input(PA6) == GPIO.HIGH
+    if state == pa6_is_high:
+        return   # no real change
+    pa6_is_high = state
+    if GPIO.input(PA3) != GPIO.LOW:
+        return   # relay not active, nothing to do
+    if state:
+        # Car detected: cancel timer, hold relay static (like PA0 re-entry)
+        peak = in_peak_hours()
+        car_log.record(peak=peak)
+        print("[PA6] car detected - holding timer (peak=%s)" % peak)
+        with relay_lock:
+            if relay_timer is not None:
+                relay_timer.cancel()
+                relay_timer = None
+    else:
+        # Car passed: start countdown (like PA0 pulse end)
+        print("[PA6] car passed - starting countdown")
+        start_countdown()
 
 def pa6_changed(channel):
-    """GPIO interrupt: print PA6 state; restart timer if PA3 is LOW and PA6 went HIGH."""
-    state = GPIO.input(PA6)
-    if state == GPIO.HIGH and GPIO.input(PA3) == GPIO.LOW:
-        print("[PA6] car detected - restarting timer")
-        start_countdown()
+    """GPIO interrupt: cancel pending PA6 debounce timer and restart it."""
+    global _debounce_pa6_timer
+    if _debounce_pa6_timer is not None:
+        _debounce_pa6_timer.cancel()
+    _debounce_pa6_timer = threading.Timer(DEBOUNCE_S, _process_pa6_settled)
+    _debounce_pa6_timer.daemon = True
+    _debounce_pa6_timer.start()
 
 GPIO.add_event_detect(PA6, GPIO.BOTH, callback=pa6_changed, bouncetime=50)
 
@@ -209,8 +237,8 @@ try:
         relay_on = _relay_activated
 
         if relay_on:
-            if pa0_was_high:
-                # PA0 HIGH (pulse active): show HOLD_TIME static as MM = SS
+            if pa0_was_high or pa6_is_high:
+                # PA0 HIGH (pulse active) or PA6 HIGH (car present): show HOLD_TIME static
                 display.display_countdown(HOLD_TIME)
             else:
                 # PA0 LOW (pulse ended): show countdown as MM = SS
