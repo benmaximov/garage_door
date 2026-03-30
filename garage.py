@@ -9,20 +9,20 @@ Hardware (all via optocouplers, no internal pulls needed):
   PA6: optical sensor input. Works only when PA3 is LOW.
        Normal LOW. Goes HIGH when car passes (optical circuit broken).
 
-Pulse logic (ACTIVE_DAYS only, within INTERVALS):
+Pulse logic (always active):
   HIGH edge (PA0) -> set PA3 LOW (prevent door closing), cancel any running timer,
                      increment counter (only on first activation, not re-entries)
-  LOW edge  (PA0) -> start HOLD_TIME countdown; PA3 stays LOW; display countdown
-  HIGH edge (PA6) -> restart HOLD_TIME countdown (car detected passing through)
+  LOW edge  (PA0) -> start countdown (HOLD_TIME in peak hours, HOLD_TIME_SHORT outside);
+                     PA3 stays LOW; display countdown
+  HIGH edge (PA6) -> cancel timer, hold relay static (car in beam)
+  LOW edge  (PA6) -> start countdown (same hold-time selection as PA0 LOW)
   Timer=0         -> set PA3 HIGH (door can close again)
-  Another HIGH (PA0) while PA3 LOW -> cancel timer, show HOLD_TIME static
-
-Outside active hours/days: PA0 pulses are counted only (PA3 not touched).
+  Another HIGH (PA0) while PA3 LOW -> cancel timer, hold relay static
 
 Display:
-  PA3 LOW + PA0 HIGH -> HOLD_TIME number (static, all 8 digits)
-  PA3 LOW + PA0 LOW  -> countdown seconds (decrementing, all 8 digits)
-  PA3 HIGH           -> internet: cycle clock/counter  |  no internet: counter only
+  PA3 LOW + PA0/PA6 HIGH -> hold-time static (HOLD_TIME in peak hours, HOLD_TIME_SHORT outside)
+  PA3 LOW + PA0/PA6 LOW  -> countdown seconds (decrementing) — same for peak and non-peak
+  PA3 HIGH               -> internet: cycle clock/counter  |  no internet: counter only
 """
 
 import OPi.GPIO as GPIO
@@ -78,7 +78,6 @@ _relay_activated   = False  # True only when relay was closed by door-sensor log
 DEBOUNCE_S          = 0.2
 _debounce_timer     = None
 _debounce_pa6_timer = None
-_flash_counter      = False   # set True to force display to counter phase immediately
 
 # ── Internet status ───────────────────────────────────────────────────────────
 def read_internet_status():
@@ -152,10 +151,6 @@ def _process_pa0_settled():
             # First activation: increment counter regardless of peak hours
             new_count = counter.increment()
             print("[sensor] count=%d" % new_count)
-            if not in_peak_hours():
-                global _flash_counter
-                _flash_counter = True
-                print("[relay] outside active hours/days - short hold")
         close_relay()   # counter already incremented above if first activation
     else:
         # PA0 went LOW: pulse end (remote released)
@@ -229,19 +224,15 @@ try:
         if display_tick % REINIT_EVERY == 0:
             display.init()
 
-        # If a count happened outside peak hours, jump to counter phase
-        if _flash_counter:
-            _flash_counter = False
-            display_tick = DISPLAY_TIME   # start of counter phase
-
         relay_on = _relay_activated
 
         if relay_on:
             if pa0_was_high or pa6_is_high:
-                # PA0 HIGH (pulse active) or PA6 HIGH (car present): show HOLD_TIME static
-                display.display_countdown(HOLD_TIME)
+                # PA0 HIGH (pulse active) or PA6 HIGH (car present): show hold-time static
+                hold = HOLD_TIME if in_peak_hours() else HOLD_TIME_SHORT
+                display.display_countdown(hold)
             else:
-                # PA0 LOW (pulse ended): show countdown as MM = SS
+                # PA0 LOW and PA6 LOW: show live countdown (same for peak and non-peak)
                 remaining = max(0, int(relay_release_time - time.time()))
                 display.display_countdown(remaining)
         else:
