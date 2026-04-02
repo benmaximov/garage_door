@@ -7,10 +7,14 @@ Endpoints:
   GET /pulse?duration=<secs>           -> pulses PA1 for the given duration
   GET /gpio                            -> {"PA0": 0|1, "PA1": 0|1, "PA3": 0|1}
   GET /gpio/set?pin=PA1|PA3&state=HIGH|LOW -> set PA1 or PA3 output state
-  GET /hold                            -> sets PA3 LOW
-  GET /release                         -> sets PA3 HIGH (default)
-  GET /cars                            -> list of PA6 car-pass events in the last 24 h
-                                          [{"ts": "...", "peak": true|false}, ...]
+  GET /hold                            -> hold relay: sets PA3 LOW, cancels timer, sets api_hold_active
+  GET /release                         -> release relay: sets PA3 HIGH, clears timers and flags
+  GET /cars                            -> list of PA6 car-pass events in buffer
+                                          [{"date": "...", "opening": "...", "peak": 0|1, "counter": <int>}, ...]
+  GET /clicks                          -> list of button-click events in buffer
+                                          [{"date": "...", "opening": "...", "counter": <int>, "var": 1|2}, ...]
+  GET /flush                           -> save counter + flush log buffers to MySQL now (resets 30-min timer)
+                                          {"ok": true, "counter": <int>}
 
 Start by calling start() which launches the server in a daemon thread.
 garage.py calls api.start() during startup.
@@ -24,7 +28,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import OPi.GPIO as GPIO
 import counter as cnt
-import car_log
+import db_log
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 API_PORT           = 8080
@@ -44,6 +48,7 @@ _READ_PINS  = [PA0, PA1, PA3, PA6]  # pins reported by GET /gpio
 # Note: garage.py sets up GPIO mode and PA1 already; this module only uses it.
 _pa1_lock = threading.Lock()
 _pa1_timer = None
+_api_pulse_pending = False   # sticky flag: set before PA1 HIGH, cleared on PA0 LOW edge
 
 
 def _end_pulse():
@@ -53,16 +58,33 @@ def _end_pulse():
     GPIO.output(PA1, GPIO.LOW)
 
 
+def is_api_pulse():
+    """Return True if the current PA0 cycle was triggered by an API /pulse call.
+    The flag is sticky: set when /pulse fires PA1, survives the PA1 timer ending,
+    and is only cleared by clear_api_pulse() when PA0 settles back to LOW.
+    """
+    with _pa1_lock:
+        return _api_pulse_pending
+
+
+def clear_api_pulse():
+    """Clear the API pulse flag. Called from garage.py when PA0 LOW edge is processed."""
+    global _api_pulse_pending
+    with _pa1_lock:
+        _api_pulse_pending = False
+
+
 def pulse_pa1(duration=PULSE_DURATION_S):
     """Raise PA1 HIGH for 'duration' seconds, then drop LOW."""
-    global _pa1_timer
-    GPIO.output(PA1, GPIO.HIGH)
+    global _pa1_timer, _api_pulse_pending
     with _pa1_lock:
+        _api_pulse_pending = True
         if _pa1_timer is not None:
             _pa1_timer.cancel()
         _pa1_timer = threading.Timer(duration, _end_pulse)
         _pa1_timer.daemon = True
         _pa1_timer.start()
+    GPIO.output(PA1, GPIO.HIGH)
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -87,6 +109,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/counter":
             self._send_json(200, {"counter": cnt.open_count})
+        elif path == "/flush":
+            db_log.flush()
+            self._send_json(200, {"ok": True, "counter": cnt.open_count})
         elif path == "/pulse":
             duration = PULSE_DURATION_S
             if "duration" in params:
@@ -99,7 +124,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/gpio":
             self._send_json(200, {pin: GPIO.input(pin) for pin in _READ_PINS})
         elif path == "/cars":
-            self._send_json(200, car_log.get())
+            self._send_json(200, db_log.get())
+        elif path == "/clicks":
+            self._send_json(200, db_log.get_clicks())
         elif path == "/gpio/set":
             pin = params.get("pin", [None])[0] or ""
             # normalise to canonical "PA<n>" form
@@ -123,6 +150,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/hold":
             import garage
             garage.api_hold_active = True
+            if not garage._relay_activated:
+                db_log.relay_open()
+            garage._relay_activated = True
             with garage.relay_lock:
                 if garage.relay_timer is not None:
                     garage.relay_timer.cancel()
@@ -132,6 +162,12 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/release":
             import garage
             garage.api_hold_active = False
+            with garage.relay_lock:
+                if garage.relay_timer is not None:
+                    garage.relay_timer.cancel()
+                    garage.relay_timer = None
+            garage._relay_activated = False
+            db_log.relay_closed()
             GPIO.output(PA3, GPIO.HIGH)
             self._send_json(200, {"ok": True, "PA3": "HIGH"})
         else:

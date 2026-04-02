@@ -4,16 +4,12 @@ counter.py - Open-count persistence for garage.py
 Provides:
   open_count         - module-level integer, current door-open count
   load_count()       - read persisted value from disk
-  save_count()       - write current open_count to disk
+  save_count()       - write current open_count to disk (called by db_log.flush)
   increment()        - increment open_count and return new value
-  periodic_save()    - schedule recurring save every SAVE_INTERVAL seconds
 """
-
-import threading
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 COUNTER_FILE  = "/root/garage_count.txt"
-SAVE_INTERVAL = 24 * 3600   # save every 24 hours
 
 # ── State ─────────────────────────────────────────────────────────────────────
 open_count = 0   # loaded / updated at runtime
@@ -44,12 +40,3 @@ def increment():
     global open_count
     open_count += 1
     return open_count
-
-
-def periodic_save():
-    """Save counter now, then reschedule after SAVE_INTERVAL seconds."""
-    save_count()
-    print("[counter] saved count=%d" % open_count)
-    t = threading.Timer(SAVE_INTERVAL, periodic_save)
-    t.daemon = True
-    t.start()
