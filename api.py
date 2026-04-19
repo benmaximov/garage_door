@@ -22,13 +22,13 @@ garage.py calls api.start() during startup.
 
 import re
 import threading
-import time
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import OPi.GPIO as GPIO
 import counter as cnt
 import db_log
+import state
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 API_PORT           = 8080
@@ -102,6 +102,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        try:
+            self._do_GET_inner()
+        except Exception as exc:
+            try:
+                self._send_json(500, {"error": str(exc)})
+            except Exception:
+                pass
+
+    def _do_GET_inner(self):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         path   = parsed.path
@@ -136,37 +145,35 @@ class _Handler(BaseHTTPRequestHandler):
                 pin = "PA" + _m_digit.group(1)
             elif _m_pa:
                 pin = "PA" + _m_pa.group(1)
-            state = (params.get("state", [None])[0] or "").upper()
+            pin_state = (params.get("state", [None])[0] or "").upper()
             # normalise "1"/"0" -> "HIGH"/"LOW"
-            state = {"1": "HIGH", "0": "LOW"}.get(state, state)
+            pin_state = {"1": "HIGH", "0": "LOW"}.get(pin_state, pin_state)
             if not _PIN_RE.match(pin) or pin not in _OUT_PINS:
                 self._send_json(400, {"error": "pin must be a writable PA pin (e.g. PA1, pa1, 1)"})
-            elif state not in ("HIGH", "LOW"):
+            elif pin_state not in ("HIGH", "LOW"):
                 self._send_json(400, {"error": "state must be HIGH, LOW, 1, or 0"})
             else:
-                level = GPIO.HIGH if state == "HIGH" else GPIO.LOW
+                level = GPIO.HIGH if pin_state == "HIGH" else GPIO.LOW
                 GPIO.output(pin, level)
-                self._send_json(200, {"ok": True, "pin": pin, "state": state})
+                self._send_json(200, {"ok": True, "pin": pin, "state": pin_state})
         elif path == "/hold":
-            import garage
-            garage.api_hold_active = True
-            if not garage._relay_activated:
+            state.api_hold_active = True
+            if not state.relay_activated:
                 db_log.relay_open()
-            garage._relay_activated = True
-            with garage.relay_lock:
-                if garage.relay_timer is not None:
-                    garage.relay_timer.cancel()
-                    garage.relay_timer = None
+            state.relay_activated = True
+            with state.relay_lock:
+                if state.relay_timer is not None:
+                    state.relay_timer.cancel()
+                    state.relay_timer = None
             GPIO.output(PA3, GPIO.LOW)
             self._send_json(200, {"ok": True, "PA3": "LOW"})
         elif path == "/release":
-            import garage
-            garage.api_hold_active = False
-            with garage.relay_lock:
-                if garage.relay_timer is not None:
-                    garage.relay_timer.cancel()
-                    garage.relay_timer = None
-            garage._relay_activated = False
+            state.api_hold_active = False
+            with state.relay_lock:
+                if state.relay_timer is not None:
+                    state.relay_timer.cancel()
+                    state.relay_timer = None
+            state.relay_activated = False
             db_log.relay_closed()
             GPIO.output(PA3, GPIO.HIGH)
             self._send_json(200, {"ok": True, "PA3": "HIGH"})

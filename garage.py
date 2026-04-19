@@ -25,7 +25,7 @@ API hold / release:
   /hold    -> sets PA3 LOW and api_hold_active=True; no timer is started or restarted
               by PA0 or PA6 events until /release is called.
   /release -> cancel any running timer, set PA3 HIGH, clear api_hold_active and
-              _relay_activated; normal operation resumes.
+              relay_activated; normal operation resumes.
   PA6 events during API hold still log/count cars but do NOT start a countdown.
 
 Display:
@@ -43,6 +43,7 @@ import counter
 import display
 import api
 import db_log
+import state
 
 # ── Configuration ────────────────────────────────────────────────────────────
 INTERNET_STATUS_FILE = "/dev/shm/internet_ok"
@@ -74,13 +75,6 @@ GPIO.setup(PA6, GPIO.IN)   # no pull: optocoupler drives LOW normally, HIGH when
 pa0_was_high = GPIO.input(PA0) == GPIO.HIGH
 pa6_is_high  = GPIO.input(PA6) == GPIO.HIGH
 
-# ── Relay state ───────────────────────────────────────────────────────────────
-relay_lock         = threading.Lock()
-relay_timer        = None
-relay_release_time = 0.0   # time.time() when relay will release
-_relay_activated   = False  # True only when relay was closed by door-sensor logic
-api_hold_active    = False  # True while /hold API is active; cleared by /release
-
 # ── Debounce ──────────────────────────────────────────────────────────────────
 # Delayed-read debounce: any GPIO interrupt restarts a DEBOUNCE_S timer.
 # When the timer fires (after the signal has settled), the actual pin level
@@ -110,10 +104,9 @@ def in_peak_hours():
 # ── Relay control ─────────────────────────────────────────────────────────────
 def release_relay():
     """Open the relay (called by timer expiry only)."""
-    global relay_timer, _relay_activated
-    with relay_lock:
-        relay_timer = None
-    _relay_activated = False
+    with state.relay_lock:
+        state.relay_timer = None
+    state.relay_activated = False
     db_log.relay_closed()
     GPIO.output(PA3, GPIO.HIGH)
     print("[relay] released")
@@ -123,40 +116,38 @@ def close_relay():
     Called on PA0 HIGH edge (pulse start). Timer starts on the next LOW edge (pulse end).
     Counter increment is handled by the caller before this is called.
     """
-    global relay_timer, _relay_activated
-    if not _relay_activated:
+    if not state.relay_activated:
         db_log.relay_open()
-    _relay_activated = True
+    state.relay_activated = True
     GPIO.output(PA3, GPIO.LOW)
-    with relay_lock:
-        if relay_timer is not None:
-            relay_timer.cancel()
-            relay_timer = None
+    with state.relay_lock:
+        if state.relay_timer is not None:
+            state.relay_timer.cancel()
+            state.relay_timer = None
     print("[relay] closed / re-entry - timer cancelled, holding")
 
 def start_countdown(hold_time=None):
     """Start (or restart) countdown. Called on PA0 LOW edge (pulse end) or PA6 LOW edge."""
-    global relay_timer, relay_release_time
     if hold_time is None:
         hold_time = HOLD_TIME if in_peak_hours() else HOLD_TIME_SHORT
-    relay_release_time = time.time() + hold_time
-    with relay_lock:
-        if relay_timer is not None:
-            relay_timer.cancel()
-        relay_timer = threading.Timer(hold_time, release_relay)
-        relay_timer.daemon = True
-        relay_timer.start()
+    state.relay_release_time = time.time() + hold_time
+    with state.relay_lock:
+        if state.relay_timer is not None:
+            state.relay_timer.cancel()
+        state.relay_timer = threading.Timer(hold_time, release_relay)
+        state.relay_timer.daemon = True
+        state.relay_timer.start()
     print("[relay] countdown started, hold=%ds" % hold_time)
 
 # ── Interrupt callback (both edges) ──────────────────────────────────────────
 def _process_pa0_settled():
     """Called after DEBOUNCE_S of quiet on PA0 - read actual pin state and act."""
     global pa0_was_high, pa6_is_high
-    state = GPIO.input(PA0) == GPIO.HIGH
-    if state == pa0_was_high:
+    s = GPIO.input(PA0) == GPIO.HIGH
+    if s == pa0_was_high:
         return   # no real change
-    pa0_was_high = state
-    if state:
+    pa0_was_high = s
+    if s:
         # PA0 went HIGH: pulse start (remote pressed)
         print("[sensor] pulse start (HIGH)")
         first_activation = GPIO.input(PA3) != GPIO.LOW
@@ -183,7 +174,7 @@ def _process_pa0_settled():
         print("[sensor] pulse end (LOW)")
         api.clear_api_pulse()
         if GPIO.input(PA3) == GPIO.LOW:
-            if api_hold_active:
+            if state.api_hold_active:
                 print("[sensor] pulse end - API hold active, no countdown")
             else:
                 start_countdown()   # hold_time auto-selected based on in_peak_hours()
@@ -201,29 +192,29 @@ GPIO.add_event_detect(PA0, GPIO.BOTH, callback=pa0_changed, bouncetime=50)
 
 def _process_pa6_settled():
     """Called after DEBOUNCE_S of quiet on PA6 - read actual pin state and act."""
-    global pa6_is_high, relay_timer
-    state = GPIO.input(PA6) == GPIO.HIGH
-    if state == pa6_is_high:
+    global pa6_is_high
+    s = GPIO.input(PA6) == GPIO.HIGH
+    if s == pa6_is_high:
         return   # no real change
-    pa6_is_high = state
-    if state:
+    pa6_is_high = s
+    if s:
         # Car detected: only act if relay is active (PA3 LOW or just being activated).
-        # Use _relay_activated rather than the physical PA3 pin because the pin may
+        # Use relay_activated rather than the physical PA3 pin because the pin may
         # not have been driven LOW yet if the PA0 debounce is still in flight.
-        if not _relay_activated:
+        if not state.relay_activated:
             return   # relay not active, ignore
         peak = in_peak_hours()
         db_log.car_pass(peak=peak)
         print("[PA6] car detected - holding timer (peak=%s)" % peak)
-        with relay_lock:
-            if relay_timer is not None:
-                relay_timer.cancel()
-                relay_timer = None
+        with state.relay_lock:
+            if state.relay_timer is not None:
+                state.relay_timer.cancel()
+                state.relay_timer = None
     else:
         # Car passed: only start countdown if relay is physically held LOW
         if GPIO.input(PA3) != GPIO.LOW:
             return   # relay already released, nothing to do
-        if api_hold_active:
+        if state.api_hold_active:
             print("[PA6] car passed - API hold active, no countdown")
         else:
             print("[PA6] car passed - starting countdown")
@@ -261,7 +252,7 @@ try:
         if display_tick % REINIT_EVERY == 0:
             display.init()
 
-        relay_on = _relay_activated
+        relay_on = state.relay_activated
 
         if relay_on:
             if pa0_was_high or pa6_is_high:
@@ -270,7 +261,7 @@ try:
                 display.display_countdown(hold)
             else:
                 # PA0 LOW and PA6 LOW: show live countdown (same for peak and non-peak)
-                remaining = max(0, int(relay_release_time - time.time()))
+                remaining = max(0, int(state.relay_release_time - time.time()))
                 display.display_countdown(remaining)
         else:
             # Relay off: normal cycle or counter-only
@@ -291,9 +282,9 @@ except KeyboardInterrupt:
 
 finally:
     counter.save_count()
-    with relay_lock:
-        if relay_timer is not None:
-            relay_timer.cancel()
+    with state.relay_lock:
+        if state.relay_timer is not None:
+            state.relay_timer.cancel()
     GPIO.output(PA3, GPIO.HIGH)
     GPIO.cleanup()
     display.close()
