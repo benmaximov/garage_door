@@ -1,0 +1,7 @@
+#!/bin/bash
+# Weekly disk cleanup - prevents disk-full condition
+apt-get clean
+find /var/log -name "*.gz" -delete
+find /var/log -name "*.1" -delete
+find /var/log -name "*.old" -delete
+journalctl --vacuum-size=30M
