@@ -84,3 +84,293 @@ systemctl start garage
 systemctl status garage
 journalctl -u garage -f
 ```
+
+---
+
+## Initial Setup — Orange Pi Zero (H2+, 256 MB)
+
+This section documents the full provisioning procedure from a bare Armbian Stretch image to a running garage controller.
+
+### 1. Flash the SD card
+
+Use Armbian Debian Stretch (legacy kernel) for the Orange Pi Zero H2+.  
+Flash with Balena Etcher or `dd`. Boot with serial console attached (115200 baud) or with an Ethernet cable connected.
+
+Default root credentials are `root / 1234` — Armbian forces a password change on first login.
+
+---
+
+### 2. Basic system configuration
+
+```bash
+# Set hostname
+hostnamectl set-hostname garage
+echo "garage" > /etc/hostname
+
+# Set timezone
+timedatectl set-timezone Europe/Sofia   # adjust to your zone
+```
+
+Remove the default non-root user created by Armbian if not needed:
+
+```bash
+deluser --remove-home orangepi
+```
+
+---
+
+### 3. Expand the root filesystem
+
+Armbian may not auto-expand to the full SD card. Do it manually:
+
+```bash
+# Check current layout
+lsblk
+
+# Use armbian-config or resize manually:
+armbian-config   # → System → Resize
+
+# Or manually with fdisk + resize2fs after reboot
+```
+
+---
+
+### 4. Fix apt sources (Debian Stretch only)
+
+Stretch reached end-of-life; its repos moved to the archive:
+
+```bash
+cat > /etc/apt/sources.list << 'EOF'
+deb http://archive.debian.org/debian stretch main contrib non-free
+deb http://archive.debian.org/debian-security stretch/updates main contrib non-free
+EOF
+
+apt-get update
+apt-get dist-upgrade -y
+```
+
+---
+
+### 5. Disable unused hardware and services
+
+Reduces memory usage and heat:
+
+```bash
+# Blacklist unused kernel modules
+cat > /etc/modprobe.d/blacklist-unused.conf << 'EOF'
+blacklist snd_soc_core
+blacklist snd_pcm
+blacklist snd_timer
+blacklist snd
+blacklist lima
+blacklist drm
+blacklist videobuf2_core
+blacklist videobuf2_v4l2
+blacklist sunxi_cedrus
+EOF
+
+# Disable unused services
+systemctl disable --now ModemManager NetworkManager dnsmasq hostapd bluetooth 2>/dev/null
+```
+
+---
+
+### 6. Set CPU governor to powersave and cap maximum frequency
+
+The H2+ runs hot at full speed; 480 MHz is sufficient for this workload.  
+Setting both the governor and `scaling_max_freq` prevents the kernel from ever clocking above 480 MHz:
+
+```bash
+cat > /etc/rc.local << 'EOF'
+#!/bin/sh -e
+echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+echo 480000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
+exit 0
+EOF
+chmod +x /etc/rc.local
+```
+
+Apply immediately without rebooting:
+
+```bash
+echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+echo 480000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
+```
+
+Verify:
+
+```bash
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq   # should print 480000
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq   # should print 480000
+```
+
+---
+
+### 7. Enable SPI1 in the device tree
+
+The MAX7219 display is wired to SPI1 (PA13/PA14/PA15). The stock DTB does not enable it.
+
+Back up and patch the DTB:
+
+```bash
+cp /boot/dtb/sun8i-h2-plus-orangepi-zero.dtb \
+   /boot/dtb/sun8i-h2-plus-orangepi-zero.dtb.bak
+
+apt-get install -y device-tree-compiler
+dtc -I dtb -O dts /boot/dtb/sun8i-h2-plus-orangepi-zero.dtb -o /tmp/opi.dts
+```
+
+In `/tmp/opi.dts`:
+
+- Find the `spi@1c69000` node (SPI1) — set `status = "okay"` and add a `spidev@0` child node:
+
+```dts
+spi@1c69000 {
+    status = "okay";
+    spidev@0 {
+        compatible = "rohm,dh2228fv";
+        reg = <0>;
+        spi-max-frequency = <10000000>;
+    };
+};
+```
+
+- Find the `spi@1c68000` node (SPI0) — set `status = "disabled"` and remove the `flash@0` child node if present.
+
+Recompile and reboot:
+
+```bash
+dtc -I dts -O dtb /tmp/opi.dts -o /boot/dtb/sun8i-h2-plus-orangepi-zero.dtb
+reboot
+```
+
+After reboot, `/dev/spidev0.0` should appear.
+
+---
+
+### 8. Install Python dependencies
+
+```bash
+apt-get install -y python3 python3-pip
+pip3 install OPi.GPIO spidev pymysql
+```
+
+`pymysql` is only needed if MySQL logging is used (`db_log.py`). The controller runs without it.
+
+---
+
+### 9. Deploy application files
+
+Copy all `.py` files and service units from this repository to `/root/` on the device:
+
+```bash
+scp *.py *.service wifi-watchdog.sh root@<device-ip>:/root/
+```
+
+Install and start the garage service:
+
+```bash
+chmod +x /root/wifi-watchdog.sh
+
+systemctl daemon-reload
+
+systemctl enable garage
+systemctl start garage
+
+systemctl enable wifi-watchdog
+systemctl start wifi-watchdog
+```
+
+---
+
+### 10. Configure WiFi
+
+Create the wpa_supplicant credentials file:
+
+```bash
+cat > /etc/wpa_supplicant/wpa_supplicant.conf << 'EOF'
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+country=BG
+
+network={
+    ssid="YOUR_SSID"
+    psk="YOUR_PASSWORD"
+    key_mgmt=WPA-PSK
+}
+EOF
+chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+```
+
+Create the interface configuration:
+
+```bash
+cat > /etc/network/interfaces.d/wlan0 << 'EOF'
+auto wlan0
+iface wlan0 inet dhcp
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+EOF
+```
+
+Set a higher metric on wlan0 so eth0 remains the fallback default route:
+
+```bash
+cat > /etc/dhcp/dhclient-exit-hooks.d/wlan0-route-fix << 'EOF'
+if [ "$interface" = "wlan0" ] && [ "$reason" = "BOUND" -o "$reason" = "RENEW" -o "$reason" = "REBIND" -o "$reason" = "REBOOT" ]; then
+    ip route del default via "$new_routers" dev wlan0 2>/dev/null
+    ip route add default via "$new_routers" dev wlan0 metric 50
+fi
+EOF
+chmod +x /etc/dhcp/dhclient-exit-hooks.d/wlan0-route-fix
+```
+
+Bring the interface up:
+
+```bash
+ifup wlan0
+```
+
+Verify connectivity:
+
+```bash
+ip route          # should show wlan0 default at metric 50
+ping -c 3 8.8.8.8
+```
+
+---
+
+### 11. Configure static IP on eth0 (optional)
+
+Useful for direct Windows host ↔ device connection for SSH/serial fallback:
+
+```bash
+cat > /etc/network/interfaces.d/eth0 << 'EOF'
+auto eth0
+iface eth0 inet static
+    address 192.168.137.5
+    netmask 255.255.255.0
+    gateway 192.168.137.1
+    metric 100
+    dns-nameservers 8.8.8.8
+EOF
+```
+
+---
+
+### 12. Verify everything is running
+
+```bash
+systemctl status garage
+systemctl status wifi-watchdog
+journalctl -u garage -f
+
+# Check internet flag written by watchdog
+cat /dev/shm/internet_ok   # should print 1
+
+# Check SPI display device
+ls /dev/spidev*            # should show /dev/spidev0.0
+
+# Test the HTTP API
+curl http://localhost:8080/counter
+curl http://localhost:8080/gpio
+```

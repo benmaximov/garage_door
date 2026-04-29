@@ -7,8 +7,7 @@
 # WiFi reconnect is attempted only when ping has failed FAIL_THRESHOLD times
 # in a row, to avoid reacting to transient packet loss.
 #
-# wlan0 is managed by wifi.service (wpa_supplicant) and wifi-dhcp.service (dhclient).
-# wifi-dhcp.service restarts automatically via BindsTo=wifi.service.
+# wlan0 is managed by ifupdown (wpa-conf in /etc/network/interfaces.d/wlan0).
 
 IFACE="wlan0"
 PING_HOST="8.8.8.8"
@@ -29,8 +28,10 @@ check_connectivity() {
 reconnect_wifi() {
     echo "$(date): Internet down after $FAIL_THRESHOLD consecutive failures - reconnecting WiFi..."
 
-    # Restart wpa_supplicant (wifi-dhcp.service follows via BindsTo)
-    systemctl restart wifi.service
+    # Full interface cycle - brings wpa_supplicant + DHCP back up
+    ifdown wlan0 2>/dev/null
+    sleep 3
+    ifup wlan0 &
 
     # Wait for association + DHCP
     sleep "$RECONNECT_WAIT"
