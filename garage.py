@@ -223,6 +223,8 @@ def _process_pa6_settled():
 def pa6_changed(channel):
     """GPIO interrupt: cancel pending PA6 debounce timer and restart it."""
     global _debounce_pa6_timer
+    if state.suppress_pa6_isr:
+        return   # /optocheck in flight — ignore edges entirely
     if _debounce_pa6_timer is not None:
         _debounce_pa6_timer.cancel()
     _debounce_pa6_timer = threading.Timer(DEBOUNCE_S, _process_pa6_settled)
@@ -230,6 +232,20 @@ def pa6_changed(channel):
     _debounce_pa6_timer.start()
 
 GPIO.add_event_detect(PA6, GPIO.BOTH, callback=pa6_changed, bouncetime=50)
+
+# ── PA6 ISR resync (called by api.optocheck) ─────────────────────────────────
+def _resync_pa6():
+    """Cancel any pending PA6 debounce timer and resync cached pa6_is_high
+    to the true physical pin level. Called by api.optocheck() after it
+    finishes driving PA3, so the next real edge compares against truth.
+    """
+    global _debounce_pa6_timer, pa6_is_high
+    if _debounce_pa6_timer is not None:
+        _debounce_pa6_timer.cancel()
+        _debounce_pa6_timer = None
+    pa6_is_high = GPIO.input(PA6) == GPIO.HIGH
+
+state.resync_pa6 = _resync_pa6
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 counter.load_count()

@@ -19,21 +19,28 @@ All inputs use optocouplers; no internal pull-up/pull-down resistors are needed.
 
 ## Behaviour
 
-### Outside active hours / days
-- PA0 pulses (LOW → HIGH) are **counted only**.
-- PA3 is never touched.
-- Display cycles between current time and the opening counter (or shows counter only when there is no internet).
+The pulse logic is **always active** — every remote press activates the relay. What changes with time of day is only the hold duration:
 
-### During active hours (Mon–Fri, 07:00–09:00 and 17:00–19:00)
-1. **PA0 HIGH edge** → set PA3 LOW (prevent door from closing), increment counter, cancel any running timer.
-2. **PA0 LOW edge** (pulse end) → start the 15-minute hold timer.
-3. **PA6 HIGH edge** (car detected passing) → restart the 15-minute hold timer.
-4. **Another PA0 HIGH** while timer is running → cancel timer (show static HOLD_TIME), restart on next LOW edge.
-5. **Timer expires** → set PA3 HIGH (door can close again).
+- **During active hours** (Mon–Fri, 07:00–09:00 and 17:00–19:00): hold PA3 LOW for `HOLD_TIME` (15 min) after each cycle.
+- **Outside active hours / days**: hold PA3 LOW for `HOLD_TIME_SHORT` (60 s) after each cycle.
 
-### Display during hold
-- PA0 HIGH (pulse active): static `MM=SS` showing the full hold time.
-- PA0 LOW (pulse ended): live `MM=SS` countdown to release.
+The counter is incremented on every first activation (PA0 HIGH while PA3 is HIGH) regardless of time of day.
+
+### Event sequence (same for peak and non-peak, only hold duration differs)
+1. **PA0 HIGH edge** (remote pressed) → set PA3 LOW, increment counter (if first activation), cancel any running timer.
+2. **PA0 LOW edge** (remote released) → start countdown (`HOLD_TIME` peak / `HOLD_TIME_SHORT` non-peak).
+3. **PA6 HIGH edge** (car enters the beam) → **cancel** the running timer; hold PA3 LOW indefinitely while the car is in the beam.
+4. **PA6 LOW edge** (car leaves the beam) → start a fresh countdown (same duration selection as rule 2).
+5. **Another PA0 HIGH** while PA3 is already LOW → cancel the timer; new countdown starts on the next PA0 LOW edge.
+6. **Timer expires** → set PA3 HIGH (door can close again).
+
+### Display behaviour
+- **Relay idle** (PA3 HIGH):
+  - With internet: cycle clock (15 s) and opening counter (5 s).
+  - Without internet: counter only.
+- **Relay active** (PA3 LOW):
+  - PA0 HIGH (button pressed) OR PA6 HIGH (car in beam) → static `MM=SS` showing the full hold time.
+  - PA0 LOW and PA6 LOW (idle, waiting for timeout) → live `MM=SS` countdown to release.
 
 ---
 
@@ -43,7 +50,8 @@ All inputs use optocouplers; no internal pull-up/pull-down resistors are needed.
 |----------|---------|---------|
 | `INTERVALS` | `[(7,9),(17,19)]` | Active time windows (hour, hour) |
 | `ACTIVE_DAYS` | `[0,1,2,3,4]` | Mon–Fri (0=Mon … 6=Sun) |
-| `HOLD_TIME` | `900` s (15 min) | How long to keep PA3 LOW after a pulse |
+| `HOLD_TIME` | `900` s (15 min) | Hold duration during active hours |
+| `HOLD_TIME_SHORT` | `60` s | Hold duration outside active hours / days |
 
 ---
 
@@ -55,8 +63,12 @@ All inputs use optocouplers; no internal pull-up/pull-down resistors are needed.
 | `GET /pulse[?duration=S]` | Pulse PA1 HIGH for `S` seconds (default 1 s) to trigger door open |
 | `GET /gpio` | `{"PA0":0/1, "PA1":0/1, "PA3":0/1, "PA6":0/1}` — current pin states |
 | `GET /gpio/set?pin=PA1&state=HIGH` | Set PA1 or PA3 output state |
-| `GET /hold` | Force PA3 LOW (hold door open) |
-| `GET /release` | Force PA3 HIGH (allow door to close) |
+| `GET /hold` | Force PA3 LOW (hold door open indefinitely, disables timer starts) |
+| `GET /release` | Force PA3 HIGH (allow door to close; clears hold and timers) |
+| `GET /cars` | List of buffered PA6 car-pass events: `[{"date":..., "opening":..., "peak":0\|1, "counter":N}, ...]` |
+| `GET /clicks` | List of buffered button-click events: `[{"date":..., "opening":..., "counter":N, "var":1\|2}, ...]` (`var=1` remote, `var=2` API) |
+| `GET /flush` | Save counter and flush log buffers to MySQL immediately (resets the 30-min auto-flush timer). Returns `{"ok": true, "counter": N}` |
+| `GET /optocheck` | Diagnostic: briefly power the optical sensor and read PA6. Returns `{"status": "normal"\|"blocked", "pa6": 0\|1, "held": true\|false}`. `normal` = optical loop intact (nothing in the beam); `blocked` = something is in the way. Does **not** affect counters, car-pass logs or hold timers. If PA3 is already LOW (relay active or `/hold` in effect), PA6 is sampled without releasing PA3 (`held: true`). |
 
 ---
 
@@ -64,11 +76,15 @@ All inputs use optocouplers; no internal pull-up/pull-down resistors are needed.
 
 | File | Purpose |
 |------|---------|
-| `garage.py` | Main controller — GPIO, logic, display loop |
+| `garage.py` | Main controller — GPIO, pulse logic, display loop |
 | `api.py` | HTTP API server (runs in background thread) |
+| `state.py` | Shared mutable state + locks between `garage.py` and `api.py` |
 | `display.py` | MAX7219 SPI driver (`display_number`, `display_time`, `display_countdown`) |
 | `counter.py` | Opening-count persistence (`/root/garage_count.txt`) |
+| `db_log.py` | MySQL logger for clicks and car-pass events (buffered, auto-flush every 30 min) |
 | `garage.service` | systemd unit — auto-start on boot |
+| `wifi-watchdog.sh` | Reconnects WiFi on sustained internet loss; writes `/dev/shm/internet_ok` |
+| `wifi-watchdog.service` | systemd unit for the watchdog |
 
 ---
 
@@ -354,6 +370,8 @@ iface eth0 inet static
     dns-nameservers 8.8.8.8
 EOF
 ```
+
+**Important**: the `metric 100` line is essential. Without it, ifupdown installs the eth0 default route at metric 0, which beats wlan0's metric 50 — and when the eth0 cable is unplugged, the kernel still routes packets out the downed interface instead of falling through to wlan0. Symptom: `ping 8.8.8.8` fails with "Destination Host Unreachable" via eth0 even though wlan0 is fully associated.
 
 ---
 

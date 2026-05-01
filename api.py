@@ -15,13 +15,15 @@ Endpoints:
                                           [{"date": "...", "opening": "...", "counter": <int>, "var": 1|2}, ...]
   GET /flush                           -> save counter + flush log buffers to MySQL now (resets 30-min timer)
                                           {"ok": true, "counter": <int>}
-
-Start by calling start() which launches the server in a daemon thread.
-garage.py calls api.start() during startup.
+  GET /optocheck                       -> {"status": "normal"|"blocked", "pa6": 0|1, "held": true|false}
+                                          Briefly pulls PA3 LOW to power the optical sensor, reads PA6.
+                                          If relay is already active (PA3 already LOW), just reads PA6
+                                          without touching PA3 or any counters/timers.
 """
 
 import re
 import threading
+import time
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -49,6 +51,70 @@ _READ_PINS  = [PA0, PA1, PA3, PA6]  # pins reported by GET /gpio
 _pa1_lock = threading.Lock()
 _pa1_timer = None
 _api_pulse_pending = False   # sticky flag: set before PA1 HIGH, cleared on PA0 LOW edge
+
+# ── Optical-path check ────────────────────────────────────────────────────────
+_optocheck_lock    = threading.Lock()   # serialise concurrent /optocheck calls
+OPTOCHECK_HOLD_S   = 0.15               # how long to hold PA3 LOW while sampling PA6
+OPTOCHECK_SETTLE_S = 0.05               # wait after PA3 LOW before reading PA6
+
+
+def optocheck():
+    """Check the optical-sensor path without disturbing the main state machine.
+
+    Behaviour:
+      * If the relay is currently active (state.relay_activated == True — set
+        by the pulse logic or by /hold), just read PA6 and return. PA3 is left
+        LOW, no timer is touched, no edges are suppressed (the normal PA6 ISR
+        is needed for car-pass logging during a real hold).
+      * Otherwise (relay idle, PA3 HIGH), temporarily:
+          1. Suppress the PA6 ISR so no edge we cause can reach the state
+             machine (no car_pass logs, no spurious countdown starts).
+          2. Drive PA3 LOW to power the optocoupler, wait to settle, read PA6.
+          3. Restore PA3 HIGH — but ONLY if state.relay_activated is still
+             False. If a real PA0 edge fired during our sampling window and
+             legitimately activated the relay, leave PA3 LOW so we don't fight
+             the pulse logic.
+          4. Resume the PA6 ISR, resyncing its cached level to truth.
+
+    Concurrent /optocheck calls are serialised by _optocheck_lock.
+
+    No counters, car-pass logs, db_log entries or timers are touched.
+    Returns (status_str, pa6_level, already_held_bool).
+    """
+    with _optocheck_lock:
+        already_held = state.relay_activated
+        if already_held:
+            # Relay is in legitimate use — just sample PA6, touch nothing.
+            # The normal PA6 ISR must stay live to log any real car passages.
+            pa6 = GPIO.input(PA6)
+        else:
+            # Relay is idle: safe to drive PA3 briefly. Suppress PA6 ISR first
+            # so any edge we induce cannot enter the state machine.
+            state.suppress_pa6_isr = True
+            try:
+                GPIO.output(PA3, GPIO.LOW)
+                try:
+                    time.sleep(OPTOCHECK_SETTLE_S)
+                    pa6 = GPIO.input(PA6)
+                    time.sleep(OPTOCHECK_HOLD_S - OPTOCHECK_SETTLE_S)
+                finally:
+                    # If a real pulse legitimately activated the relay during
+                    # our window, DO NOT pull PA3 back HIGH — that would break
+                    # the hold. Only restore HIGH if still idle.
+                    if not state.relay_activated:
+                        GPIO.output(PA3, GPIO.HIGH)
+                    # Brief settle so the opto has reached its post-test level
+                    # before we resync pa6_is_high and re-enable the ISR.
+                    time.sleep(OPTOCHECK_SETTLE_S)
+            finally:
+                # Resync garage.py's cached pa6_is_high and cancel any
+                # pending debounce timer BEFORE re-enabling the ISR, so the
+                # next real edge compares against truth.
+                if state.resync_pa6 is not None:
+                    state.resync_pa6()
+                state.suppress_pa6_isr = False
+        status = "blocked" if pa6 == GPIO.HIGH else "normal"
+        return status, int(pa6 == GPIO.HIGH), already_held
 
 
 def _end_pulse():
@@ -156,6 +222,9 @@ class _Handler(BaseHTTPRequestHandler):
                 level = GPIO.HIGH if pin_state == "HIGH" else GPIO.LOW
                 GPIO.output(pin, level)
                 self._send_json(200, {"ok": True, "pin": pin, "state": pin_state})
+        elif path == "/optocheck":
+            status, pa6, held = optocheck()
+            self._send_json(200, {"status": status, "pa6": pa6, "held": held})
         elif path == "/hold":
             state.api_hold_active = True
             if not state.relay_activated:
