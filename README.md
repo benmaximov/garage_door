@@ -328,7 +328,7 @@ iface wlan0 inet dhcp
 EOF
 ```
 
-Set a higher metric on wlan0 so eth0 remains the fallback default route:
+Assign wlan0 a **lower metric** (50) than eth0 (100) so it becomes the preferred default route — lower numbers always win in Linux routing:
 
 ```bash
 cat > /etc/dhcp/dhclient-exit-hooks.d/wlan0-route-fix << 'EOF'
