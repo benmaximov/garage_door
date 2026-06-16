@@ -257,4 +257,4 @@ def start(port=API_PORT):
     t = threading.Thread(target=server.serve_forever, name="api-server")
     t.daemon = True
     t.start()
-    print("[api] HTTP server listening on port %d" % port)
+    print("[api] listening on port %d" % port)

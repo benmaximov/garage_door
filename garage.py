@@ -109,7 +109,6 @@ def release_relay():
     state.relay_activated = False
     db_log.relay_closed()
     GPIO.output(PA3, GPIO.HIGH)
-    print("[relay] released")
 
 def close_relay():
     """Set PA3 LOW (prevent door closing) and cancel any running timer.
@@ -124,7 +123,7 @@ def close_relay():
         if state.relay_timer is not None:
             state.relay_timer.cancel()
             state.relay_timer = None
-    print("[relay] closed / re-entry - timer cancelled, holding")
+
 
 def start_countdown(hold_time=None):
     """Start (or restart) countdown. Called on PA0 LOW edge (pulse end) or PA6 LOW edge."""
@@ -137,7 +136,7 @@ def start_countdown(hold_time=None):
         state.relay_timer = threading.Timer(hold_time, release_relay)
         state.relay_timer.daemon = True
         state.relay_timer.start()
-    print("[relay] countdown started, hold=%ds" % hold_time)
+
 
 # ── Interrupt callback (both edges) ──────────────────────────────────────────
 def _process_pa0_settled():
@@ -149,7 +148,6 @@ def _process_pa0_settled():
     pa0_was_high = s
     if s:
         # PA0 went HIGH: pulse start (remote pressed)
-        print("[sensor] pulse start (HIGH)")
         first_activation = GPIO.input(PA3) != GPIO.LOW
         if first_activation:
             # First activation: increment counter regardless of peak hours
@@ -168,15 +166,11 @@ def _process_pa0_settled():
             pa6_is_high = True
             peak = in_peak_hours()
             db_log.car_pass(peak=peak)
-            print("[sensor] car already on beam at activation (peak=%s)" % peak)
     else:
         # PA0 went LOW: pulse end (remote released)
-        print("[sensor] pulse end (LOW)")
         api.clear_api_pulse()
         if GPIO.input(PA3) == GPIO.LOW:
-            if state.api_hold_active:
-                print("[sensor] pulse end - API hold active, no countdown")
-            else:
+            if not state.api_hold_active:
                 start_countdown()   # hold_time auto-selected based on in_peak_hours()
 
 def pa0_changed(channel):
@@ -205,7 +199,6 @@ def _process_pa6_settled():
             return   # relay not active, ignore
         peak = in_peak_hours()
         db_log.car_pass(peak=peak)
-        print("[PA6] car detected - holding timer (peak=%s)" % peak)
         with state.relay_lock:
             if state.relay_timer is not None:
                 state.relay_timer.cancel()
@@ -214,10 +207,7 @@ def _process_pa6_settled():
         # Car passed: only start countdown if relay is physically held LOW
         if GPIO.input(PA3) != GPIO.LOW:
             return   # relay already released, nothing to do
-        if state.api_hold_active:
-            print("[PA6] car passed - API hold active, no countdown")
-        else:
-            print("[PA6] car passed - starting countdown")
+        if not state.api_hold_active:
             start_countdown()
 
 def pa6_changed(channel):
@@ -254,8 +244,7 @@ display.display_number(counter.open_count)
 db_log.start_timer()
 api.start()
 
-print("garage.py running - press Ctrl+C to stop")
-print("Intervals: %s  Active days: %s  hold=%ds" % (INTERVALS, ACTIVE_DAYS, HOLD_TIME))
+print("garage.py started - intervals=%s days=%s hold=%ds" % (INTERVALS, ACTIVE_DAYS, HOLD_TIME))
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 DISPLAY_TIME  = 15   # seconds to show clock in cycle

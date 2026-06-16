@@ -9,7 +9,7 @@ Provides:
 """
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-COUNTER_FILE  = "/root/garage_count.txt"
+COUNTER_FILE  = "/data/garage_count.txt"
 
 # ── State ─────────────────────────────────────────────────────────────────────
 open_count = 0   # loaded / updated at runtime

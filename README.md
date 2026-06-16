@@ -80,7 +80,7 @@ The counter is incremented on every first activation (PA0 HIGH while PA3 is HIGH
 | `api.py` | HTTP API server (runs in background thread) |
 | `state.py` | Shared mutable state + locks between `garage.py` and `api.py` |
 | `display.py` | MAX7219 SPI driver (`display_number`, `display_time`, `display_countdown`) |
-| `counter.py` | Opening-count persistence (`/root/garage_count.txt`) |
+| `counter.py` | Opening-count persistence (`/data/garage_count.txt`) |
 | `db_log.py` | MySQL logger for clicks and car-pass events (buffered, auto-flush every 30 min) |
 | `garage.service` | systemd unit — auto-start on boot |
 | `wifi-watchdog.sh` | Reconnects WiFi on sustained internet loss; writes `/dev/shm/internet_ok` |
@@ -114,6 +114,10 @@ Flash with Balena Etcher or `dd`. Boot with serial console attached (115200 baud
 
 Default root credentials are `root / 1234` — Armbian forces a password change on first login.
 
+Access methods:
+- **SSH**: `ssh root@192.168.137.5` (password: `1`)
+- **Serial console**: COM17, 115200 baud (via PuTTY or similar)
+
 ---
 
 ### 2. Basic system configuration
@@ -135,18 +139,98 @@ deluser --remove-home orangepi
 
 ---
 
-### 3. Expand the root filesystem
+### 3. Partition layout and SD card longevity
 
-Armbian may not auto-expand to the full SD card. Do it manually:
+The stock image is ~2 GB. The 32 GB SD card is partitioned as follows to maximise flash longevity:
+
+| Partition | Size | FS | Mount | Purpose |
+|-----------|------|-----|-------|---------|
+| mmcblk0p1 | 50 MB | FAT32 | /boot | Kernel, DTB, boot script (rarely written) |
+| mmcblk0p2 | 4 GB | ext4 | / | Root OS (`noatime,commit=600`) |
+| mmcblk0p3 | 16 MB | ext4 (no journal) | /data | Mutable state: `garage_count.txt` (`noatime,nodiratime`) |
+| (unallocated) | ~25 GB | — | — | Over-provisioning for SD card wear leveling |
+
+**Why?** Cheap SD cards fail from write amplification. The counter file was being rewritten every 30 minutes to the root ext4 filesystem — journal + metadata updates on the same cells wore the card out. Now:
+- Counter writes go to `/data` (journalless ext4 = minimal write amplification)
+- `/var/log` and `/tmp` are mounted as tmpfs (RAM) — zero disk writes from logging
+- systemd-journald is set to `Storage=volatile` (RAM only, capped at 10 MB)
+- rsyslog is fully disabled (masked)
+- Login accounting (`wtmp`, `btmp`, `lastlog`) symlinked to `/dev/null`
+- Bash history disabled (`unset HISTFILE` in `.bashrc`)
+- Root FS has `commit=600` as a safety net but receives no writes during normal operation
+- 25 GB unallocated = the SD card controller has ample spare blocks for wear leveling
+- `apt-daily` timers are disabled to prevent background package-index writes
+
+**Result:** During normal operation the only flash write is `garage_count.txt` to `/data` every 30 minutes. The root FS is effectively read-only at runtime.
+
+**Expanding from the stock image:**
 
 ```bash
-# Check current layout
-lsblk
+# Rewrite partition table (p2 expanded to 4GB, p3 added as 16MB)
+sfdisk --force /dev/mmcblk0 << 'EOF'
+label: dos
+label-id: 0x2e1fecc5
+unit: sectors
 
-# Use armbian-config or resize manually:
-armbian-config   # → System → Resize
+/dev/mmcblk0p1 : start=       40960, size=      102400, type=c
+/dev/mmcblk0p2 : start=      143360, size=     8388608, type=83
+/dev/mmcblk0p3 : start=     8531968, size=       32768, type=83
+EOF
 
-# Or manually with fdisk + resize2fs after reboot
+# Tell kernel about new partitions
+partprobe /dev/mmcblk0
+
+# Grow ext4 to fill expanded p2
+resize2fs /dev/mmcblk0p2
+
+# Format p3 as ext4 without journal (flash-friendly)
+mkfs.ext4 -L data -O ^has_journal -m 0 -b 4096 /dev/mmcblk0p3
+
+# Mount and initialise
+mkdir -p /data
+mount -o noatime,nodiratime /dev/mmcblk0p3 /data
+echo '0' > /data/garage_count.txt
+```
+
+Add to `/etc/fstab`:
+
+```
+/dev/mmcblk0p2  /        ext4    defaults,noatime,commit=600      0  1
+/dev/mmcblk0p3  /data    ext4    defaults,noatime,nodiratime      0  0
+tmpfs           /tmp     tmpfs   defaults,noatime,nosuid,size=20m 0  0
+tmpfs           /var/log tmpfs   defaults,noatime,nosuid,mode=0755,size=10m 0 0
+```
+
+Eliminate all writes to root FS:
+
+```bash
+# Disable apt auto-update timers
+systemctl disable apt-daily.timer apt-daily-upgrade.timer
+
+# Journal to RAM only (volatile)
+cat > /etc/systemd/journald.conf << 'EOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=10M
+ForwardToSyslog=no
+ForwardToConsole=no
+EOF
+
+# Disable and mask rsyslog
+systemctl disable --now rsyslog
+systemctl mask rsyslog syslog.socket
+
+# Remove persistent journal data
+rm -rf /var/log/journal
+
+# Redirect login accounting to /dev/null
+rm -f /var/log/wtmp /var/log/btmp /var/log/lastlog
+ln -sf /dev/null /var/log/wtmp
+ln -sf /dev/null /var/log/btmp
+ln -sf /dev/null /var/log/lastlog
+
+# Disable bash history writes
+echo 'unset HISTFILE' >> /root/.bashrc
 ```
 
 ---
@@ -169,7 +253,7 @@ apt-get dist-upgrade -y
 
 ### 5. Disable unused hardware and services
 
-Reduces memory usage and heat:
+Reduces memory usage, heat, and unnecessary SD card writes:
 
 ```bash
 # Blacklist unused kernel modules
@@ -185,8 +269,13 @@ blacklist videobuf2_v4l2
 blacklist sunxi_cedrus
 EOF
 
-# Disable unused services
-systemctl disable --now ModemManager NetworkManager dnsmasq hostapd bluetooth 2>/dev/null
+# Purge unnecessary packages
+apt-get purge -y modemmanager network-manager dnsmasq
+apt-get autoremove --purge -y
+
+# Disable remaining unnecessary services
+systemctl disable --now bluetooth hostapd 2>/dev/null
+systemctl disable apt-daily.timer apt-daily-upgrade.timer
 ```
 
 ---
@@ -224,9 +313,9 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq   # should print 48000
 
 ### 7. Enable SPI1 in the device tree
 
-The MAX7219 display is wired to SPI1 (PA13/PA14/PA15). The stock DTB does not enable it.
+The MAX7219 display is wired to SPI1 (PA13/PA14/PA15). The stock DTB does not enable it and the `spidev` kernel module is not loaded by default — both must be fixed.
 
-Back up and patch the DTB:
+**Step 1: Back up and decompile the DTB:**
 
 ```bash
 cp /boot/dtb/sun8i-h2-plus-orangepi-zero.dtb \
@@ -236,31 +325,56 @@ apt-get install -y device-tree-compiler
 dtc -I dtb -O dts /boot/dtb/sun8i-h2-plus-orangepi-zero.dtb -o /tmp/opi.dts
 ```
 
-In `/tmp/opi.dts`:
+**Step 2: Patch `/tmp/opi.dts`:**
 
-- Find the `spi@1c69000` node (SPI1) — set `status = "okay"` and add a `spidev@0` child node:
+Find the `spi@1c69000` node (SPI1). In the stock DTB it looks like:
 
 ```dts
 spi@1c69000 {
+    compatible = "allwinner,sun8i-h3-spi";
+    ...
+    status = "disabled";       /* <-- change to "okay" */
+    #address-cells = <0x1>;
+    #size-cells = <0x0>;
+    phandle = <0x52>;
+                               /* <-- add spidev child node here */
+};
+```
+
+Change `status` to `"okay"` and add a `spidev@0` child node after the `phandle` line:
+
+```dts
+spi@1c69000 {
+    ...
     status = "okay";
+    #address-cells = <0x1>;
+    #size-cells = <0x0>;
+    phandle = <0x52>;
+
     spidev@0 {
         compatible = "rohm,dh2228fv";
-        reg = <0>;
+        reg = <0x0>;
         spi-max-frequency = <10000000>;
     };
 };
 ```
 
-- Find the `spi@1c68000` node (SPI0) — set `status = "disabled"` and remove the `flash@0` child node if present.
+Also ensure `spi@1c68000` (SPI0) remains `status = "disabled"`.
 
-Recompile and reboot:
+**Step 3: Recompile and reboot:**
 
 ```bash
 dtc -I dts -O dtb /tmp/opi.dts -o /boot/dtb/sun8i-h2-plus-orangepi-zero.dtb
 reboot
 ```
 
-After reboot, `/dev/spidev0.0` should appear.
+**Step 4: Ensure the spidev kernel module loads at boot:**
+
+```bash
+echo spidev >> /etc/modules
+```
+
+After reboot, verify: `ls /dev/spidev0.0` — should exist. If it doesn't appear, load manually with `modprobe spidev` and check `dmesg | grep spi`.
 
 ---
 
@@ -268,10 +382,17 @@ After reboot, `/dev/spidev0.0` should appear.
 
 ```bash
 apt-get install -y python3 python3-pip
-pip3 install OPi.GPIO spidev pymysql
+pip3 install OPi.GPIO spidev "PyMySQL==0.9.3"
 ```
 
+`PyMySQL` is pinned to 0.9.3 — later versions require Python 3.6+.  
 `pymysql` is only needed if MySQL logging is used (`db_log.py`). The controller runs without it.
+
+Also ensure `spidev` kernel module loads at boot:
+
+```bash
+echo spidev >> /etc/modules
+```
 
 ---
 
@@ -322,11 +443,13 @@ Create the interface configuration:
 
 ```bash
 cat > /etc/network/interfaces.d/wlan0 << 'EOF'
-auto wlan0
+allow-hotplug wlan0
 iface wlan0 inet dhcp
     wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
 EOF
 ```
+
+**Note:** Use `allow-hotplug` (not `auto`) so boot doesn't block for 5 minutes if WiFi is out of range. The wifi-watchdog handles reconnection.
 
 Assign wlan0 a **lower metric** (50) than eth0 (100) so it becomes the preferred default route — lower numbers always win in Linux routing:
 

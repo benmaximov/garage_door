@@ -65,8 +65,6 @@ def relay_open():
     global _open_ts
     with _lock:
         _open_ts = datetime.now()
-        ts = _open_ts
-    print("[db_log] relay opened at %s" % ts.strftime("%Y-%m-%d %H:%M:%S"))
 
 
 def relay_closed():
@@ -74,7 +72,6 @@ def relay_closed():
     global _open_ts
     with _lock:
         _open_ts = None
-    print("[db_log] relay closed - opening timestamp cleared")
 
 
 def car_pass(peak):
@@ -91,12 +88,7 @@ def car_pass(peak):
         row = {"date": now, "opening": opening, "peak": int(bool(peak)), "counter": counter.open_count}
         if len(_buf) >= MAX_BUFFER:
             _buf.popleft()
-            print("[db_log] buffer full - oldest entry discarded")
         _buf.append(row)
-    print("[db_log] car_pass recorded: date=%s opening=%s peak=%d"
-          % (now.strftime("%Y-%m-%d %H:%M:%S"),
-             opening.strftime("%Y-%m-%d %H:%M:%S"),
-             int(bool(peak))))
 
 
 def click_record(var):
@@ -130,12 +122,7 @@ def click_record(var):
         }
         if len(_clicks_buf) >= MAX_BUFFER:
             _clicks_buf.popleft()
-            print("[db_log] clicks buffer full - oldest entry discarded")
         _clicks_buf.append(row)
-    print("[db_log] click_record: date=%s opening=%s counter=%d var=%d"
-          % (now.strftime("%Y-%m-%d %H:%M:%S"),
-             opening.strftime("%Y-%m-%d %H:%M:%S"),
-             cnt, int(var)))
 
 
 def get():
@@ -177,7 +164,6 @@ def flush():
 
     # ── 1. Save counter to disk ───────────────────────────────────────────
     counter.save_count()
-    print("[db_log] counter saved (%d)" % counter.open_count)
 
     # ── 2. Cancel pending timer and snapshot buffers ────────────────────────
     with _lock:
@@ -252,8 +238,6 @@ def flush():
                 for _ in range(len(clicks_rows)):
                     if _clicks_buf:
                         _clicks_buf.popleft()
-            print("[db_log] flushed %d car row(s) and %d click row(s) to MySQL"
-                  % (len(rows), len(clicks_rows)))
 
         except Exception as exc:
             print("[db_log] flush failed (%s) - %d car row(s), %d click row(s) kept in buffer"
